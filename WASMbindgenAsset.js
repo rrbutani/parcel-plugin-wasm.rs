@@ -18,8 +18,11 @@ const cmdExists = async (cmd) => {
 }
 
 class WASMbindgenAsset extends Asset {
+  // type = 'wasm'
+
   constructor(name, options) {
     super(name, options)
+    this.type = 'js';
   }
 
   process() {
@@ -30,12 +33,103 @@ class WASMbindgenAsset extends Asset {
     return super.process()
   }
 
-  isTragetRust() {
+  isTargetRust() {
     return path.basename(this.name) === 'Cargo.toml' || path.extname(this.name) === '.rs'
   }
 
   isNormalTOML() {
     return path.extname(this.name) === '.toml'
+  }
+
+  buildOpts() {
+    let inReleaseMode = true;
+    let wasmPackProfile = 'release';
+
+    // To figure out the build mode, we'll check WASM_PACK_PROFILE first
+    // followed by NODE_ENV. If neither are specified we'll default to using
+    // release mode.
+    const wasmPackProfileEnv = process.env.WASM_PACK_PROFILE
+    const nodeEnv = process.env.NODE_ENV
+
+    if (wasmPackProfileEnv !== undefined) {
+      switch (wasmPackProfileEnv.toLowerCase()) {
+        case 'dev':
+        case 'debug':
+          inReleaseMode = false
+          wasmPackProfile = 'dev'
+          break
+        case 'release':
+          inReleaseMode = true
+          wasmPackProfile = 'release'
+          break
+        case 'profiling':
+          inReleaseMode = true
+          wasmPackProfile = 'profiling'
+          break
+        default:
+          throw `${wasmPackProfileEnv} (set by WASM_PACK_PROFILE) is not a recognized wasm-pack build profile`
+      }
+    } else if (nodeEnv !== undefined) {
+      switch (nodeEnv.toLowerCase()) {
+        case 'dev':
+        case 'development':
+          inReleaseMode = false
+          wasmPackProfile = 'dev'
+          break
+        case 'release':
+        case 'production':
+          inReleaseMode = true
+          wasmPackProfile = 'release'
+          break
+
+        // Unlike with WASM_PACK_PROFILE, we won't throw on unrecognized values
+        // of NODE_ENV.
+      }
+    }
+
+    // TODO:
+    // I'm inclined not to translate `this.options.minify` as `-Clink-arg=-s`
+    // like the default parcel Rust plugin does because:
+    //  - there isn't really a way to signal this to wasm-pack (which invokes
+    //    wasm-opt which also has -Os and -Oz flags)
+    //  - this is probably not what users actually want? aiui, minify is enabled
+    //    for production builds (when NODE_ENV=production) and you'd usually
+    //    want -O3
+    //  - I think it's much better to just respect whatever users have already
+    //    asked for in their Cargo.toml files for the profile we end up using
+    //
+    // As for logLevels: cargo offers a verbose option but wasm-pack and
+    // wasm-bindgen don't so I'm not sure there's a point...
+    //
+    // For sourceMaps: wasm-bindgen/rustc don't support source maps but they
+    // do support DWARF debug info that browsers seem to be picking up support
+    // for: https://developers.google.com/web/updates/2019/12/webassembly
+    // wasm-bindgen seems to have options to preserve (and correctly update?)
+    // the debug sections in what it produces; when using wasm-pack this is
+    // enabled for the debug profile (with settings in Cargo.toml overriding).
+    // I'm, again, reticent to try to pass this option into wasm-bindgen and
+    // wasm-pack when sourceMaps are enabled because:
+    //  - we have no way pass this into wasm-pack
+    //  - when using wasm-pack I don't have a good answer for who takes
+    //    precedence: the Cargo.toml settings or `this.options`
+    // So for now, we can maybe just pass in the flag (`--keep-debug`) into
+    // wasm-bindgen when sourceMaps are enabled.
+    //
+    // For autoInstall, we could try to install wasm-pack _always_ and just
+    // ditch the wasm-bindgen support. I kind of want to do this because we
+    // don't properly replicate some of the things wasm-pack does (i.e. add in
+    // the wasm-bindgen debug asserts (`--debug`) if requested — we could add
+    // in the flag for this but I don't want to replicate more wasm-pack
+    // functionality here). I think it's also a little weird to fall back to
+    // wasm-bindgen calls with no warning since the produced .wasm files can be
+    // worse (i.e. we don't call wasm-opt manually).
+    let { logLevel, sourceMaps, autoInstall } = this.options;
+
+    return {
+      cargoTargetDirName: inReleaseMode ? 'release' : 'debug',
+      cargoProfile: inReleaseMode ? '--release' : '--debug',
+      wasmPackProfile,
+    }
   }
 
   async crateTypeCheck(cargoConfig) {
@@ -49,7 +143,7 @@ class WASMbindgenAsset extends Asset {
   }
 
   async parse(code) {
-    if (!this.isTragetRust()) {
+    if (!this.isTargetRust()) {
       if (this.isNormalTOML())
         return toml.parse(code)
       else
@@ -77,6 +171,7 @@ class WASMbindgenAsset extends Asset {
         throw 'Please install wasm-pack'
       }
     } else {
+      // TODO: autoInstall things would go here
       throw 'Please install Cargo for Rust'
     }
 
@@ -85,6 +180,8 @@ class WASMbindgenAsset extends Asset {
 
   async wasmPackBuild(cargoConfig, cargoDir, has_deps) {
     const hasBuildCommand = await exec('wasm-pack', ['build', '--help']).then(() => true).catch(() => false)
+    const isNode = this.options.target === 'node'
+    const { wasmPackProfile } = this.buildOpts();
 
     let args
     if (hasBuildCommand) {
@@ -93,25 +190,46 @@ class WASMbindgenAsset extends Asset {
       args = has_deps ? ['init', '-m', 'no-install'] : ['init']
     }
 
-    if (process.env.WASM_PACK_PROFILE)
-      args.push(`--${process.env.WASM_PACK_PROFILE}`)
+    // TODO: test whether versions of `wasm-pack` that don't have a build
+    // command support `--target` (and if they don't, do we need to detect
+    // this/try to support them?).
+    if (isNode) {
+      args.push(...['--target', 'nodejs'])
+    } else {
+      args.push(...['--target', 'bundler'])
+      // Actually using the web target is problematic because we're not actually
+      // being used as a module by a browser. This causes import.meta to break.
+      // import.meta is problematic anyways since babel does not yet support
+      // it (it's being worked on: https://github.com/babel/babel/issues/11364)
+      // There are plugins that enable it but still.
+      //
+      // Also, most importantly, parcel (understandably) can't trace through
+      // the import.meta import that wasm-bindgen produces (or any import.meta
+      // import — not that it makes a difference).
+      // args.push(...['--target', 'web'])
+    }
+
+    args.push(`--${wasmPackProfile}`)
 
     await exec('wasm-pack', args, {
       cwd: cargoDir
     })
 
     return {
-      outDir: cargoDir + '/pkg',
+      outDir: path.join(cargoDir, 'pkg'),
       rustName: cargoConfig.package.name.replace(/-/g, '_'),
-      loc: path.join(cargoDir, 'pkg'),
-      target_folder: process.env.WASM_PACK_PROFILE === 'dev' ? 'debug' : 'release'
+      cargoDir,
     }
   }
 
   async rawBuild(cargoConfig, cargoDir) {
     try {
+      let { cargoProfile, cargoTargetDirName } = this.buildOpts();
+
       // Run cargo
-      let args = ['+nightly', 'build', '--target', RUST_TARGET, '--release']
+      // TODO: earlier we used `nightly` here; is this still what we want?
+      // (wasm/wasm-bindgen work on stable now)
+      let args = ['build', '--target', RUST_TARGET, cargoProfile]
       await exec('cargo', args, {cwd: cargoDir})
 
       // Get output file paths
@@ -120,110 +238,49 @@ class WASMbindgenAsset extends Asset {
       })
       const cargoMetadata = JSON.parse(stdout)
       const cargoTargetDir = cargoMetadata.target_directory
-      let outDir = path.join(cargoTargetDir, RUST_TARGET, 'release')
+      let outDir = path.join(cargoTargetDir, RUST_TARGET, cargoTargetDir)
 
       // Rust converts '-' to '_' when outputting files.
       let rustName = cargoConfig.package.name.replace(/-/g, '_')
 
       // Build with wasm-bindgen
-      args = [path.join(outDir, rustName + '.wasm'), '--out-dir', outDir]
+      // TODO: do we try to detect/support versions of wasm-bindgen that don't
+      // support `--target`?
+      // If no: we should add a check that searches `wasm-bindgen --help` for
+      // `--target`.
+      const isNode = this.options.target === 'node'
+      args = [
+        path.join(outDir, rustName + '.wasm'),
+        '--out-dir', outDir,
+        '--target', isNode ? 'nodejs' : 'web',
+      ]
       await exec('wasm-bindgen', args, {cwd: cargoDir})
 
       return {
         outDir,
         rustName,
-        loc: path.join(cargoDir, 'target', RUST_TARGET, 'release')
-      } 
+        cargoDir,
+      }
     } catch (e) {
       throw `Building failed... Please install wasm-pack and try again.`
     }
   }
 
-  async wasmPostProcess({cargoDir, loc, outDir, rustName, target_folder}) {
-    let js_content = (await lib.readFile(path.join(outDir, rustName + '.js'))).toString()
-    let wasm_path = path.relative(path.dirname(this.name), path.join(loc, rustName + '_bg.wasm'))
-    if (wasm_path[0] !== '.')
-      wasm_path = './' + wasm_path
-    wasm_path = wasm_path.replace('\\', '/')
+  async wasmPostProcess({outDir, rustName, cargoDir}) {
+    const { cargoTargetDirName } = this.buildOpts()
 
-    js_content = js_content.replace(/import\ \*\ as\ wasm.+?;/, 'var wasm;const __exports = {};')
-    js_content = js_content.replace(/import.+?snippets.+?;/g, line => {
-      return line
-        .replace('./snippets', path.relative(__dirname + '/', path.join(cargoDir, 'pkg/snippets/')))
-        .replace(/\\/g, '/')
-    })
+    const getPath = (relative) => {
+      let p = path.relative(path.dirname(this.name), path.join(outDir, relative))
+      if (p[0] !== '.')
+        p = './' + p
+      p = p.replace('\\', '/')
 
-    const export_names = []
-    js_content = js_content.replace(/export\ function\ \w+/g, x => {
-      const name = x.slice(15)
-      export_names.push(name)
-      return '__exports.' + name + ' = function'
-    })
+      return p
+    }
 
-    // Bare enums are exported as values.
-    js_content = js_content.replace(/export\ const\ \w+/g, x => {
-      const name = x.slice(13)
-      export_names.push(name)
-      return '__exports.' + name
-    })
-
-    const exported_classes = []
-    js_content = js_content.replace(/export\ class\ \w+/g, x => {
-      const name = x.slice(12)
-      exported_classes.push(name)
-      export_names.push(name)
-      return `class ${name}`
-    })
-
-    this.wasm_bindgen_js = `
-      import wasm from '${wasm_path}'
-      export default wasm
-      ${export_names.map(name => `export const ${name} = wasm.${name}`).join('\n')}
-    `
-
-    const is_node = this.options.target === 'node';
-    const wasm_loader = js_content + '\n' +
-      exported_classes.map(c => `__exports.${c} = ${c};`).join("\n") +`
-      function init(wasm_path) {
-          const fetchPromise = fetch(wasm_path);
-          let resultPromise;
-          if (typeof WebAssembly.instantiateStreaming === 'function') {
-              resultPromise = WebAssembly.instantiateStreaming(fetchPromise, { './${rustName}.js': __exports });
-          } else {
-              resultPromise = fetchPromise
-              .then(response => response.arrayBuffer())
-              .then(buffer => WebAssembly.instantiate(buffer, { './${rustName}.js': __exports }));
-          }
-          return resultPromise.then(({instance}) => {
-              wasm = init.wasm = instance.exports;
-              __exports.wasm = wasm;
-              return;
-          });
-      };
-      function init_node(wasm_path) {
-          const fs = require('fs');
-          return new Promise(function(resolve, reject) {
-              fs.readFile(__dirname + wasm_path, function(err, data) {
-                  if (err) {
-                      reject(err);
-                  } else {
-                      resolve(data.buffer);
-                  }
-              });
-          })
-          .then(data => WebAssembly.instantiate(data, { './${rustName}': __exports }))
-          .then(({instance}) => {
-              wasm = init.wasm = instance.exports;
-              __exports.wasm = wasm;
-              return;
-          });
-      }
-      const wasm_bindgen = Object.assign(${is_node} ? init_node : init, __exports);
-      module.exports = function loadWASMBundle(bundle) {
-            return wasm_bindgen(bundle).then(() => __exports)
-      }
-    `
-    await lib.writeFile(require.resolve('./wasm-loader.js'), wasm_loader)
+    this.jsPath = getPath(rustName + '.js')
+    this.jsAltPath = getPath(rustName + '_bg.js')
+    this.wasmPath = getPath(rustName + '_bg.wasm')
 
     // Get output file paths
     let { stdout } = await exec('cargo', ['metadata', '--format-version', '1'], {
@@ -232,11 +289,18 @@ class WASMbindgenAsset extends Asset {
     })
     const cargoMetadata = JSON.parse(stdout)
     const cargoTargetDir = cargoMetadata.target_directory
-    this.depsPath = path.join(cargoTargetDir, RUST_TARGET, target_folder || 'release', rustName + '.d')
+    this.depsPath = path.join(cargoTargetDir, RUST_TARGET, cargoTargetDirName, rustName + '.d')
   }
 
+  // TODO: This seems to be copied from the built-in RustAsset.js file; there
+  // doesn't seem to be an easy way to do so but it'd be nice to import it
+  // rather than copying it here.
+  //
+  // On the other hand it's not part of the public interface and doesn't have
+  // stability guarantees (there also isn't really a good way to do this) so I
+  // guess this is fine.
   async collectDependencies() {
-    if (!this.isTragetRust())
+    if (!this.isTargetRust())
       return false
 
     // Read deps file
@@ -253,19 +317,42 @@ class WASMbindgenAsset extends Asset {
   }
 
   async generate() {
-    if (this.isTragetRust()) {
-      return [
-        {
-          type: 'js',
-          value: this.wasm_bindgen_js
+    if (this.isTargetRust()) {
+      // return /*[*/
+        // {
+        //   wasm: {
+        //     path: this.wasmPath,
+        //     // mtime: Date.now(),
+        //   }
+        // },
+
+        // return {
+        //   js: {
+        //     path: this.jsPath,
+        //     mtime: Date.now(),
+        //   },
+        // }
+
+        // console.log(this.jsPath);
+        const isNode = this.options.target === 'node'
+
+        let value
+        if (isNode) {
+          value = await lib.readFile(this.jsPath, 'utf8');
+        } else {
+          value = `import * as wasm from '${this.wasmPath}'
+export * from '${this.jsAltPath}'
+`
         }
-      ]
+
+        return [{
+          type: 'js',
+          // TODO: can we avoid reading the file in here?
+          value,
+        }]
+      // ]
     } else {
-      this.type = 'js'
-      return lib.serializeObject(
-        this.ast,
-        this.options.minify && !this.options.scopeHoist
-      )
+      throw `${this.name} is not valid Rust file or Cargo.toml`
     }
   }
 }
