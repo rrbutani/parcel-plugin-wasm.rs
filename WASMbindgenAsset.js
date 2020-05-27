@@ -251,7 +251,8 @@ class WASMbindgenAsset extends Asset {
       }
     }
 
-    this.addDependency(this.path, {includedInParent: true})
+    this.addDependency(this.depsPath, {includedInParent: true})
+    this.addDependency(this.name, {includedInParent: true})
   }
 
   async generate() {
